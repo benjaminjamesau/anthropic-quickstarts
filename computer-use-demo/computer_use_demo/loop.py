@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, cast
+import os
 
 import httpx
 from anthropic import (
@@ -86,8 +87,16 @@ async def sampling_loop(
     max_tokens: int = 4096,
 ):
     """
-    Agentic sampling loop for the assistant/tool interaction of computer use.
+    Agentic sampling loop for the assistant/tool interaction.
     """
+    
+    # Remove image filtering
+    if only_n_most_recent_images is not None:
+        only_n_most_recent_images = None
+    
+    # Increase max tokens
+    max_tokens = 32000
+    
     tool_collection = ToolCollection(
         ComputerTool(),
         BashTool(),
@@ -103,12 +112,23 @@ async def sampling_loop(
         betas = [COMPUTER_USE_BETA_FLAG]
         image_truncation_threshold = only_n_most_recent_images or 0
         if provider == APIProvider.ANTHROPIC:
-            client = Anthropic(api_key=api_key, max_retries=4)
+            client = Anthropic(
+                api_key=api_key,
+                max_retries=5,  # Increased retries
+                timeout=300.0,  # Increased timeout
+            )
             enable_prompt_caching = True
         elif provider == APIProvider.VERTEX:
-            client = AnthropicVertex()
+            client = AnthropicVertex(
+                project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+                location=os.getenv("VERTEX_LOCATION", "us-central1"),
+            )
         elif provider == APIProvider.BEDROCK:
-            client = AnthropicBedrock()
+            client = AnthropicBedrock(
+                aws_access_key=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                aws_region=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+            )
 
         if enable_prompt_caching:
             betas.append(PROMPT_CACHING_BETA_FLAG)

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import os
 import shlex
 import shutil
@@ -11,6 +12,8 @@ from uuid import uuid4
 from anthropic.types.beta import BetaToolComputerUse20241022Param
 
 from .base import BaseAnthropicTool, ToolError, ToolResult
+from .captcha_solver import CaptchaSolver
+from .form_automation import FormAutomation, FormType
 from .run import run
 
 OUTPUT_DIR = "/tmp/outputs"
@@ -29,6 +32,10 @@ Action = Literal[
     "double_click",
     "screenshot",
     "cursor_position",
+    "solve_captcha",
+    "capture_area",
+    "create_account",
+    "fill_form",
 ]
 
 
@@ -73,17 +80,14 @@ class ComputerTool(BaseAnthropicTool):
     height: int
     display_num: int | None
 
-    _screenshot_delay = 2.0
-    _scaling_enabled = True
+    _screenshot_delay = 0.5
+    _scaling_enabled = False
 
     @property
     def options(self) -> ComputerToolOptions:
-        width, height = self.scale_coordinates(
-            ScalingSource.COMPUTER, self.width, self.height
-        )
         return {
-            "display_width_px": width,
-            "display_height_px": height,
+            "display_width_px": self.width,
+            "display_height_px": self.height,
             "display_number": self.display_num,
         }
 
@@ -92,17 +96,24 @@ class ComputerTool(BaseAnthropicTool):
 
     def __init__(self):
         super().__init__()
-
-        self.width = int(os.getenv("WIDTH") or 0)
-        self.height = int(os.getenv("HEIGHT") or 0)
-        assert self.width and self.height, "WIDTH, HEIGHT must be set"
+        
+        # Remove resolution restrictions
+        self.width = int(os.getenv("WIDTH") or 1920)  # Default to 1920x1080
+        self.height = int(os.getenv("HEIGHT") or 1080)
+        
+        # Initialize tools
+        self.captcha_solver = CaptchaSolver(api_key=os.getenv("CAPTCHA_API_KEY"))
+        self.form_automation = FormAutomation(self, self.captcha_solver)
+        self.capture_area = None
+        
+        # Set up display
         if (display_num := os.getenv("DISPLAY_NUM")) is not None:
             self.display_num = int(display_num)
             self._display_prefix = f"DISPLAY=:{self.display_num} "
         else:
             self.display_num = None
-            self._display_prefix = ""
-
+            self._display_prefix = "DISPLAY=:0 "  # Default to primary display
+            
         self.xdotool = f"{self._display_prefix}xdotool"
 
     async def __call__(
@@ -113,20 +124,13 @@ class ComputerTool(BaseAnthropicTool):
         coordinate: tuple[int, int] | None = None,
         **kwargs,
     ):
+        # Remove coordinate validation
         if action in ("mouse_move", "left_click_drag"):
             if coordinate is None:
                 raise ToolError(f"coordinate is required for {action}")
-            if text is not None:
-                raise ToolError(f"text is not accepted for {action}")
-            if not isinstance(coordinate, list) or len(coordinate) != 2:
-                raise ToolError(f"{coordinate} must be a tuple of length 2")
-            if not all(isinstance(i, int) and i >= 0 for i in coordinate):
-                raise ToolError(f"{coordinate} must be a tuple of non-negative ints")
-
-            x, y = self.scale_coordinates(
-                ScalingSource.API, coordinate[0], coordinate[1]
-            )
-
+            
+            x, y = coordinate[0], coordinate[1]
+            
             if action == "mouse_move":
                 return await self.shell(f"{self.xdotool} mousemove --sync {x} {y}")
             elif action == "left_click_drag":
@@ -156,6 +160,55 @@ class ComputerTool(BaseAnthropicTool):
                     base64_image=screenshot_base64,
                 )
 
+        if action == "solve_captcha":
+            # Handle captcha solving
+            screenshot = await self.screenshot()
+            if not screenshot.base64_image:
+                raise ToolError("Failed to capture captcha screenshot")
+
+            # Save screenshot to temporary file
+            temp_path = Path(OUTPUT_DIR) / f"captcha_{uuid4().hex}.png"
+            temp_path.write_bytes(base64.b64decode(screenshot.base64_image))
+
+            try:
+                solution = await self.captcha_solver.solve_image_captcha(temp_path)
+                return ToolResult(
+                    output=f"Captcha solution: {solution}", base64_image=screenshot.base64_image
+                )
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        elif action == "capture_area":
+            if not coordinate or len(coordinate) != 4:
+                raise ToolError("capture_area requires x, y, width, height coordinates")
+            self.capture_area = ",".join(map(str, coordinate))
+            return await self.screenshot()
+
+        elif action == "create_account":
+            if "platform" not in kwargs:
+                raise ToolError("platform is required for account creation")
+            try:
+                platform = FormType(kwargs["platform"])
+                credentials = await self.form_automation.create_account(
+                    platform,
+                    **{k: v for k, v in kwargs.items() if k != "platform"}
+                )
+                return ToolResult(
+                    output=f"Account created successfully: {json.dumps(credentials, indent=2)}"
+                )
+            except Exception as e:
+                raise ToolError(f"Failed to create account: {str(e)}")
+
+        elif action == "fill_form":
+            if "form_type" not in kwargs or "data" not in kwargs:
+                raise ToolError("form_type and data are required for form filling")
+            try:
+                form_type = FormType(kwargs["form_type"])
+                await self.form_automation.fill_form(form_type, kwargs["data"])
+                return ToolResult(output="Form filled successfully")
+            except Exception as e:
+                raise ToolError(f"Failed to fill form: {str(e)}")
+
         if action in (
             "left_click",
             "right_click",
@@ -177,11 +230,7 @@ class ComputerTool(BaseAnthropicTool):
                     take_screenshot=False,
                 )
                 output = result.output or ""
-                x, y = self.scale_coordinates(
-                    ScalingSource.COMPUTER,
-                    int(output.split("X=")[1].split("\n")[0]),
-                    int(output.split("Y=")[1].split("\n")[0]),
-                )
+                x, y = int(output.split("X=")[1].split("\n")[0]), int(output.split("Y=")[1].split("\n")[0])
                 return result.replace(output=f"X={x},Y={y}")
             else:
                 click_arg = {
@@ -195,27 +244,23 @@ class ComputerTool(BaseAnthropicTool):
         raise ToolError(f"Invalid action: {action}")
 
     async def screenshot(self):
-        """Take a screenshot of the current screen and return the base64 encoded image."""
+        """Take a screenshot of the current screen or specific area."""
         output_dir = Path(OUTPUT_DIR)
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"screenshot_{uuid4().hex}.png"
 
-        # Try gnome-screenshot first
-        if shutil.which("gnome-screenshot"):
-            screenshot_cmd = f"{self._display_prefix}gnome-screenshot -f {path} -p"
+        if self.capture_area:
+            # Take screenshot of specific area
+            screenshot_cmd = f"{self._display_prefix}scrot -a {self.capture_area} {path}"
+            self.capture_area = None  # Reset after use
         else:
-            # Fall back to scrot if gnome-screenshot isn't available
-            screenshot_cmd = f"{self._display_prefix}scrot -p {path}"
+            # Take full screenshot
+            if shutil.which("gnome-screenshot"):
+                screenshot_cmd = f"{self._display_prefix}gnome-screenshot -f {path} -p"
+            else:
+                screenshot_cmd = f"{self._display_prefix}scrot {path}"
 
         result = await self.shell(screenshot_cmd, take_screenshot=False)
-        if self._scaling_enabled:
-            x, y = self.scale_coordinates(
-                ScalingSource.COMPUTER, self.width, self.height
-            )
-            await self.shell(
-                f"convert {path} -resize {x}x{y}! {path}", take_screenshot=False
-            )
-
         if path.exists():
             return result.replace(
                 base64_image=base64.b64encode(path.read_bytes()).decode()
@@ -236,25 +281,4 @@ class ComputerTool(BaseAnthropicTool):
 
     def scale_coordinates(self, source: ScalingSource, x: int, y: int):
         """Scale coordinates to a target maximum resolution."""
-        if not self._scaling_enabled:
-            return x, y
-        ratio = self.width / self.height
-        target_dimension = None
-        for dimension in MAX_SCALING_TARGETS.values():
-            # allow some error in the aspect ratio - not ratios are exactly 16:9
-            if abs(dimension["width"] / dimension["height"] - ratio) < 0.02:
-                if dimension["width"] < self.width:
-                    target_dimension = dimension
-                break
-        if target_dimension is None:
-            return x, y
-        # should be less than 1
-        x_scaling_factor = target_dimension["width"] / self.width
-        y_scaling_factor = target_dimension["height"] / self.height
-        if source == ScalingSource.API:
-            if x > self.width or y > self.height:
-                raise ToolError(f"Coordinates {x}, {y} are out of bounds")
-            # scale up
-            return round(x / x_scaling_factor), round(y / y_scaling_factor)
-        # scale down
-        return round(x * x_scaling_factor), round(y * y_scaling_factor)
+        return x, y

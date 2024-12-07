@@ -14,18 +14,22 @@ class _BashSession:
     _process: asyncio.subprocess.Process
 
     command: str = "/bin/bash"
-    _output_delay: float = 0.2  # seconds
-    _timeout: float = 120.0  # seconds
+    _output_delay: float = 0.1  # seconds
+    _timeout: float = 300.0  # seconds
     _sentinel: str = "<<exit>>"
 
     def __init__(self):
         self._started = False
         self._timed_out = False
+        # Set up environment variables
+        os.environ["DISPLAY"] = ":0"  # Default to primary display
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
 
     async def start(self):
         if self._started:
             return
 
+        # Start bash with full privileges
         self._process = await asyncio.create_subprocess_shell(
             self.command,
             preexec_fn=os.setsid,
@@ -34,6 +38,7 @@ class _BashSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=os.environ
         )
 
         self._started = True
